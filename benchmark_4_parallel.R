@@ -2,7 +2,6 @@ library(xts)
 library(forecast)
 library(ggplot2)
 library(readxl)
-library(xlsx)
 library(car)
 
 library(parallel)
@@ -10,6 +9,7 @@ library(MASS)
 library(foreach)
 library(doParallel)
 
+options(digits=3)
 
 # Data preparation
 
@@ -22,16 +22,22 @@ dd$DATE <- as.Date(dd$DATE, format = "%d.%m.%Y")
 
 # Выкинем слишком короткие ряды
 
+
 drops =  c("P_AMM_FOB_SE_ASIA","P_AMM_CFR_TURKEY", "P_AMM_CFR_SE_ASIA")
 dd = dd[, !(names(dd) %in% drops)]
+
 
 ddts <- xts(dd[, 2:ncol(dd)], order.by = dd$DATE)
 
 # Точка старта так, чтобы экзогенные переменные тоже стратовали без пропусков
-ddts = window(ddts, start = "2004-07-04")
+ddts = window(ddts, start = "2006-07-30")
 
 YNames <- colnames(ddts)[substr(colnames(ddts), 1, 2) == "P_"] # Asya: tidyselect
 XNames <- colnames(ddts)[substr(colnames(ddts), 1, 2) != "P_"]
+
+XNames = c("BRENT", "GAS_Henry", "Coal", "Urea")
+ddts = ddts[, c(YNames, XNames)]
+
 
 # Заполним пропуски предыдущими значениями там, 
 # где не было торгов и первыми известными значениями там, где нет начала ряда
@@ -56,13 +62,6 @@ plot(some_series)
 plot.xts(ddts[,YNames[1:3]], screens = factor(1, 1), auto.legend = TRUE)
 autoplot(ddts[,YNames[1:4]])
 ddts = ddts[,colSums(is.na(ddts)) == 0]
-
-XNames = c("BRENT", "GAS_Henry", "Coal")
-# Выделим отдельно только сами ряды
-
-
-data = ddts[,YNames]
-xdata = ddts[, XNames]
 
 
 
@@ -94,41 +93,56 @@ model_names = c(
 )
 
 
-benchmark = function(data, xdata, expanding = TRUE,indiff = FALSE, test_start, metric, horizon, model_names, parallel){
+benchmark = function(data, xdata, expanding = "exp",indiff = "diff", test_start, metric, horizon, model_names, parallel){
   # Сохраним датасет в исходных значениях
   data_level = cbind(data) #Глубокое копирование на всякий случай
   xdata_level = cbind(xdata)
   # Если надо, преобразуем до разностей
-  if (indiff){
+  if (indiff == "diff"){
     data = na.omit(diff(data))
     xdata = na.omit(diff(xdata))
-  }
+  } else if (indiff == "diff+xlevel") {
+    data = na.omit(diff(data))
+    xdata = na.omit(cbind(diff(xdata), xdata_level))
+  }  else if (indiff == "diff+ylevel") {
+    data = na.omit(diff(data))
+    xdata = na.omit(cbind(diff(xdata), lag(data_level)))
+  } else if (indiff == "diff+xlevel+ylevel") {
+    data = na.omit(diff(data))
+    xdata = na.omit(cbind(diff(xdata), xdata_level, lag(data_level)))
+  } 
+  
+  
+  
   
   # Вычислим количество моделей и возьмём даты в качестве индексов
   n_models = length(model_names)
   indeces = index(data)
   
   numCores = 1
-  if (parallel == TRUE){
+  if (parallel == "work"){
     numCores <- detectCores() - 1
+  } else if (parallel == "full"){
+    numCores <- detectCores()
   }
   cl <- makeCluster(numCores)
   registerDoParallel(cl)
   print(numCores)
+  
 
-  # Массив результатов
-  final = array(0, dim = c(horizon,n_models, ncol(data)), dimnames = list((1:horizon), model_names,colnames(data)))
-  # Идём по всем горизонтам
+   # Идём по всем горизонтам
   r = foreach(h = 1:horizon,
            .combine = "cbind",
            .export = c("get_prev"),
            .packages = c("xts", "forecast", "ggplot2"),
-           .verbose = T) %dopar% {
+           .verbose = FALSE) %dopar% {
              
 
     
     indeces_test = indeces[indeces >= test_start] #Ищем все стартовые точки, которые позже начала тестовой выборки
     indeces_test = indeces_test[1: (length(indeces_test) - h + 1)] #Последняя стартовая точка 
+    
+    print(length(indeces_test))
     
     # Массив для результатов
     results = array(0, dim = c(length(indeces_test),n_models, ncol(data)), dimnames = list((1:length(indeces_test)), model_names,colnames(data)))
@@ -138,7 +152,7 @@ benchmark = function(data, xdata, expanding = TRUE,indiff = FALSE, test_start, m
       
       start = 1
       # Если окно скользящее, то старт тоже двигается
-      if (expanding == FALSE){
+      if (expanding == "exp"){
         start = i
       }
       
@@ -189,12 +203,56 @@ benchmark = function(data, xdata, expanding = TRUE,indiff = FALSE, test_start, m
   return(reshape_metrics(t(r), names = colnames(data), model_names = model_names))
 }
 
+data = ddts[,YNames]
+xdata = ddts[, XNames]
 
 
-metrics = benchmark(data[,1], xdata, indiff = TRUE, expanding = FALSE, test_start = "2018-06-03", metric = "MAPE", horizon = 30, model_names = model_names, parallel = TRUE)
-autoplot(ts(metrics[,1:3,1]))
+XN = list("BRENT", "GAS_Henry", "Coal", "Urea", c("BRENT", "GAS_Henry", "Coal", "Urea"))
+indiff = c("diff", "diff+xlevel", "diff+ylevel", "diff+xlevel+ylevel")
+expanding = c("exp", "noexp")
+
+library(openxlsx)
+
+
+
+
+i = 1
+
+wb <- createWorkbook()
+
+for (name in YNames){
+  addWorksheet(wb, name)
+}
+
+for (xset in XN){
+  for (ind in indiff){
+    for (exp in expanding){
+      metrics = benchmark(data[,1], 
+                          xdata[,xset],
+                          indiff = ind,
+                          expanding = exp,
+                          test_start = "2018-11-18",
+                          metric = "MAPE",
+                          horizon = 12,
+                          model_names = model_names,
+                          parallel = "full") 
+      print(i/16)
+      
+      for (name in dimnames(metrics)[[3]]){
+        writeData(wb, name, t(c(ind, exp, xset)), startCol = 1, startRow = i)
+        writeData(wb, name, metrics[,,name], startCol = 1, startRow = i+2)
+        i = i + 16
+      }
+      
+      
+    }
+  }
+}
+
+saveWorkbook(wb, file = "benchmarks2.xlsx", overwrite = TRUE)
+
 metrics
-metrics_2 = benchmark(data[,1], xdata, indiff = TRUE, expanding = TRUE, test_start = "2018-06-03", metric = "MAPE", horizon = 30, model_names = model_names, parallel = TRUE)
+metrics_2 = benchmark(data[,1], xdata, indiff = TRUE, expanding = TRUE, test_start = "2018-06-03", metric = "MAPE", horizon = 12, model_names = model_names, parallel = TRUE)
 autoplot(ts(metrics_2[,1:3,1]))
 
 system.time(benchmark(data[,1:2], xdata, indiff = TRUE, expanding = TRUE, test_start = "2018-01-07", metric = "MAPE", horizon = 30, model_names = model_names, parallel = TRUE))
